@@ -1,8 +1,17 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.kapt")
+}
+
+val signingPropsFile = rootProject.file("signing.properties")
+val signingProperties = Properties().apply {
+    if (signingPropsFile.exists()) {
+        load(signingPropsFile.inputStream())
+    }
 }
 
 android {
@@ -16,17 +25,40 @@ android {
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
-    compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+
+    signingConfigs {
+        create("release") {
+            if (signingPropsFile.exists()) {
+                val storePath = signingProperties.getProperty("storeFilePath") ?: "keystore/release.jks"
+                storeFile = rootProject.file(storePath)
+                storePassword = signingProperties.getProperty("storePassword")
+                keyAlias = signingProperties.getProperty("keyAlias")
+                keyPassword = signingProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+    packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
 }
 
 kapt {
     arguments { arg("room.schemaLocation", "$projectDir/schemas") }
 }
 
-// The app can be built for polling before a Firebase project exists. Add the user's
-// google-services.json later; this enables Firebase initialization on the next build.
 if (file("google-services.json").exists()) {
     apply(plugin = "com.google.gms.google-services")
 }
