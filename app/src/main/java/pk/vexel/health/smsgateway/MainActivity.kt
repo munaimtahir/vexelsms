@@ -42,6 +42,7 @@ import pk.vexel.health.smsgateway.work.GatewaySyncWorker
 
 class MainActivity : ComponentActivity() {
     private var wakeSummary by mutableStateOf("Last FCM wake received: Never")
+    private var status by mutableStateOf("Not paired")
     private val scan = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK) result.data?.getStringExtra("pairing_payload")?.let(::pair)
     }
@@ -49,11 +50,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        status = statusText()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) smsPermission.launch(Manifest.permission.SEND_SMS)
         setContent {
             val scope = rememberCoroutineScope()
             var payload by remember { mutableStateOf("") }
-            var status by remember { mutableStateOf(statusText()) }
             var busy by remember { mutableStateOf(false) }
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
@@ -103,12 +104,14 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         wakeSummary = WakeReceipt.summary(this)
+        status = statusText()
     }
 
     private fun pair(raw: String) {
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) { pairPayload(raw) }
-            setContent { MaterialTheme { Surface { Text(result, Modifier.padding(24.dp)) } } }
+            // Keep Sync now and the wake observation visible after scanning a pairing QR.
+            status = result
         }
     }
 
