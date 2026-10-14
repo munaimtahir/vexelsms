@@ -6,7 +6,8 @@ import pk.vexel.health.smsgateway.work.GatewaySyncWorker
 
 class GatewayFirebaseService : FirebaseMessagingService() {
     override fun onMessageReceived(message: RemoteMessage) {
-        if (message.data.keys == setOf("type") && message.data["type"] == "work_available") {
+        if (message.notification == null && message.data.keys == setOf("type") && message.data["type"] == "work_available") {
+            WakeReceipt.record(applicationContext)
             GatewaySyncWorker.enqueue(applicationContext)
         }
     }

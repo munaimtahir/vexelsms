@@ -16,7 +16,6 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import kotlin.coroutines.resume
 import pk.vexel.health.smsgateway.GatewayApplication
 import pk.vexel.health.smsgateway.data.GatewayDatabase
 import pk.vexel.health.smsgateway.data.GatewayEvent
@@ -26,7 +25,6 @@ import pk.vexel.health.smsgateway.security.SecretStore
 import pk.vexel.health.smsgateway.transport.GatewayApi
 import pk.vexel.health.smsgateway.transport.GatewayConfig
 import pk.vexel.health.smsgateway.transport.SmsCallbackReceiver
-import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -48,9 +46,9 @@ class GatewaySyncWorker(context: Context, params: WorkerParameters) : CoroutineW
             api.post("/api/v1/communications/gateway/heartbeat/", heartbeat)
 
             // A process that died after the pre-send marker must never invoke SmsManager again.
-            dao.currentWork()?.takeIf { it.state == "INVOKING" && System.currentTimeMillis() - it.updatedAt > 120_000 }?.let { work ->
+            dao.currentWork()?.takeIf { SendSafety.needsInterruptionReview(it.state, System.currentTimeMillis() - it.updatedAt) }?.let { work ->
                 val payload = JSONObject(secrets.decrypt(work.encryptedPayload))
-                val unknown = JSONObject(payload.toString()).put("event_type", "UNKNOWN")
+                val unknown = JSONObject(payload.toString()).put("event_type", "UNKNOWN").put("error_code", "PROCESS_INTERRUPTED")
                 dao.recordCallback(work, "UNKNOWN", GatewayEvent(attemptId = work.attemptId, eventType = "UNKNOWN", encryptedPayload = secrets.encrypt(unknown.toString())))
             }
 
@@ -72,17 +70,21 @@ class GatewaySyncWorker(context: Context, params: WorkerParameters) : CoroutineW
                         .put("body", body)
                         .put("part_count", SmsManager.getDefault().divideMessage(body).size)
                     val work = GatewayWork(attempt, claimed.getString("message_uuid"), "CLAIMED", secrets.encrypt(payload.toString()), System.currentTimeMillis())
-                    if (dao.persistClaim(work)) {
-                        val started = JSONObject(payload.toString()).put("event_type", "SEND_STARTED")
-                        dao.beginTransmission(work, GatewayEvent(attemptId = attempt, eventType = "SEND_STARTED", encryptedPayload = secrets.encrypt(started.toString())))
-                    }
+                    dao.persistClaim(work)
                 }
+            }
+
+            // Resume a claim persisted before a crash, without claiming a second message.
+            dao.nextClaimed()?.let { work ->
+                val payload = JSONObject(secrets.decrypt(work.encryptedPayload))
+                val started = JSONObject(payload.toString()).put("event_type", "SEND_STARTED")
+                dao.beginTransmission(work, GatewayEvent(attemptId = work.attemptId, eventType = "SEND_STARTED", encryptedPayload = secrets.encrypt(started.toString())))
             }
 
             // SEND_STARTED is acknowledged by the server before local transition to PHYSICAL.
             syncEvents(api, dao, secrets)
             val physical = dao.physicalWork()
-            if (physical != null) submitOnce(app, dao, secrets, physical)
+            if (physical != null) submitOnce(app, api, dao, secrets, physical)
             Result.success()
         } catch (e: pk.vexel.health.smsgateway.transport.GatewayHttpException) {
             if (e.status == 401) {
@@ -96,34 +98,37 @@ class GatewaySyncWorker(context: Context, params: WorkerParameters) : CoroutineW
 
     private fun syncEvents(api: GatewayApi, dao: pk.vexel.health.smsgateway.data.GatewayDao, secrets: SecretStore) {
         for (event in dao.pendingEvents()) {
-            val stored = JSONObject(secrets.decrypt(event.encryptedPayload))
-            val values = JSONObject()
-                .put("attempt_uuid", stored.getString("attempt_uuid"))
-                .put("lease_token", stored.getString("lease_token"))
-                .put("event_type", stored.getString("event_type"))
-            if (stored.has("error_code")) values.put("error_code", stored.getString("error_code"))
             val work = dao.work(event.attemptId) ?: continue
-            values.put("event_uuid", event.eventId)
             try {
-                api.post("/api/v1/communications/gateway/messages/${work.messageId}/events/", values)
+                postEvent(api, secrets, work, event)
             } catch (error: pk.vexel.health.smsgateway.transport.GatewayHttpException) {
-                if (event.eventType == "SEND_STARTED" && error.status in 400..499) {
-                    // A rejected pre-send authorization proves the phone never got approval
-                    // to call SmsManager. Drop this expired/cancelled local lease safely.
-                    dao.discardBeforeSend(event.attemptId)
+                if (event.eventType == "SEND_STARTED" && error.status in setOf(400, 403, 404, 409, 410)) {
+                    dao.archiveBeforeSend(event)
                     continue
                 }
                 throw error
             }
-            dao.markSynced(event.eventId)
-            if (event.eventType == "SEND_STARTED") dao.setState(event.attemptId, "PHYSICAL")
+            // One Room commit: a crash cannot separate receipt from the ready state.
+            dao.acknowledgeEvent(event)
         }
     }
 
-    private fun submitOnce(context: Context, dao: pk.vexel.health.smsgateway.data.GatewayDao, secrets: SecretStore, work: GatewayWork) {
+    private fun postEvent(api: GatewayApi, secrets: SecretStore, work: GatewayWork, event: GatewayEvent) {
+        val stored = JSONObject(secrets.decrypt(event.encryptedPayload))
+        val values = JSONObject()
+            .put("attempt_uuid", stored.getString("attempt_uuid"))
+            .put("lease_token", stored.getString("lease_token"))
+            .put("event_type", stored.getString("event_type"))
+            .put("event_uuid", event.eventId)
+        if (stored.has("error_code")) values.put("error_code", stored.getString("error_code"))
+        api.post("/api/v1/communications/gateway/messages/${work.messageId}/events/", values)
+    }
+
+    private fun submitOnce(context: Context, api: GatewayApi, dao: pk.vexel.health.smsgateway.data.GatewayDao, secrets: SecretStore, work: GatewayWork) {
+        // Every resumed ready state needs current server authorization using the SAME event.
+        val started = dao.event(work.attemptId, "SEND_STARTED") ?: return
         val values = JSONObject(secrets.decrypt(work.encryptedPayload))
         val parts = SmsManager.getDefault().divideMessage(values.getString("body"))
-        dao.markInvoking(work.attemptId) // durable before the external SMS call; never retry from INVOKING.
         val sent = ArrayList<PendingIntent>(parts.size)
         val delivered = ArrayList<PendingIntent>(parts.size)
         for (index in parts.indices) {
@@ -131,11 +136,28 @@ class GatewaySyncWorker(context: Context, params: WorkerParameters) : CoroutineW
             delivered += callbackIntent(context, work.attemptId, "DELIVERED_PART", index)
         }
         try {
-            SmsManager.getDefault().sendMultipartTextMessage(values.getString("recipient"), null, parts, sent, delivered)
-        } catch (_: Exception) {
-            // An exception cannot prove the carrier did not accept the SMS.
-            val unknown = JSONObject(values.toString()).put("event_type", "UNKNOWN")
-            dao.recordCallback(work, "UNKNOWN", GatewayEvent(attemptId = work.attemptId, eventType = "UNKNOWN", encryptedPayload = secrets.encrypt(unknown.toString())))
+            SendSafety.authorizeAndInvoke(
+                reauthorize = {
+                    postEvent(api, secrets, work, started)
+                    dao.acknowledgeEvent(started)
+                },
+                begin = { dao.markInvoking(work.attemptId) },
+                send = {
+                    try {
+                        SmsManager.getDefault().sendMultipartTextMessage(values.getString("recipient"), null, parts, sent, delivered)
+                    } catch (_: Exception) {
+                        // The carrier may have accepted the SMS; never invoke it again.
+                        val unknown = JSONObject(values.toString()).put("event_type", "UNKNOWN").put("error_code", "PROCESS_INTERRUPTED")
+                        dao.recordCallback(work, "UNKNOWN", GatewayEvent(attemptId = work.attemptId, eventType = "UNKNOWN", encryptedPayload = secrets.encrypt(unknown.toString())))
+                    }
+                },
+            )
+        } catch (error: pk.vexel.health.smsgateway.transport.GatewayHttpException) {
+            if (error.status in setOf(400, 403, 404, 409, 410)) {
+                dao.archiveBeforeSend(started)
+                return
+            }
+            throw error
         }
     }
 

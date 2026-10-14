@@ -27,24 +27,46 @@ In Vexel, open Settings → Communications → SMS Gateway Devices and create a 
 
 Keep the phone powered and connected to the internet. FCM carries only the data value type=work_available; Android then makes an authenticated HTTPS request to Vexel to claim work. SMS content and patient information are never included in FCM.
 
-## Server credential setup
+## Server credentials and wake observation
 
-A dedicated account exists: vexel-fcm-sender@vexelsms.iam.gserviceaccount.com. It has a project custom role with only cloudmessaging.messages.create. No private key has been generated or downloaded.
+The existing production sender key belongs only on the Vexel server at
+`/etc/vexelhms/secrets/firebase-fcm.json`. The HMS audit on 14 October 2026 observed
+root:munaim ownership and mode 640. The web service has the ADC path; the dispatcher
+service must also receive it. Never generate a replacement key for troubleshooting,
+copy it into this repository/APK, or print credentials or registration tokens.
 
-When ready, create the production key directly at the final path on the Vexel production server (not on a development machine):
+Firebase carries only `type=work_available`, without a notification payload. Version
+1.1.0 records a local receipt timestamp and shows **Last FCM wake received** in PKT
+when the app resumes. This timestamp contains no message or patient data. A successful
+server wake request alone does not establish receipt on the phone.
 
-    sudo install -d -o munaim -g munaim -m 0700 /etc/vexelhms/secrets
-    gcloud iam service-accounts keys create /etc/vexelhms/secrets/firebase-fcm.json \\
-      --iam-account=vexel-fcm-sender@vexelsms.iam.gserviceaccount.com \\
-      --project=vexelsms
-    sudo chown root:munaim /etc/vexelhms/secrets/firebase-fcm.json
-    sudo chmod 0640 /etc/vexelhms/secrets/firebase-fcm.json
-    sudo chown root:munaim /etc/vexelhms/secrets
-    sudo chmod 0750 /etc/vexelhms/secrets
+## Recovery changes (DD-027, version 1.1.0)
 
-Then add these values to the private Vexel service environment file at /home/munaim/srv/apps/vexelhms/.env:
+- A persisted CLAIMED job resumes without claiming another message. Room commits the
+  SEND_STARTED acknowledgement and ready state together. Legacy STARTING/acknowledged
+  jobs also recover.
+- Every ready job replays its original SEND_STARTED event UUID for fresh server
+  authorization before the durable INVOKING marker and SmsManager call. Expired,
+  cancelled or superseded authorization is archived locally as REVIEW_REQUIRED;
+  work/events are retained. Internet errors retry synchronization, not physical SMS.
+- INVOKING is never submitted twice. An interrupted invocation becomes UNKNOWN;
+  multipart partial success also becomes UNKNOWN. Callback result codes are captured
+  before asynchronous processing and error summaries use allowlisted codes.
+- Buffered callbacks retain their event UUID across retries. The coordinated HMS
+  change acknowledges historical/superseded results without changing a current attempt.
+  Staff can review UNKNOWN without retry, allowing unrelated gateway work to continue.
+- The Room schema remains version 1; no local data reset or destructive migration.
 
-    FCM_PROJECT_ID=vexelsms
-    GOOGLE_APPLICATION_CREDENTIALS=/etc/vexelhms/secrets/firebase-fcm.json
+Five JUnit regressions are in `SendSafetyTest`: rejected authorization, interruption
+following the durable marker, reauthorization order, multipart aggregation and late
+callback ordering. Android builds/test execution were explicitly deferred by the owner
+in this sprint. The previous build was interrupted; neither this APK nor these new
+JUnit cases are claimed as built, installed, or green.
 
-Restart only vexelhms.service. Never copy this server key into the Android repository or APK, and never put its contents in documentation or logs. FCM token registration is sent by the paired device over its existing authenticated gateway heartbeat; it is not used to authenticate to Vexel.
+Later, run `./gradlew :app:testDebugUnitTest :app:assembleDebug`, then install an update
+signed with the SAME key as the current phone app. Use the configured release signing
+instead if that is what the phone already runs. Do not uninstall or clear app data to
+work around a signature mismatch: retained work and callback evidence matter. Verify
+1.1.0 on the paired phone and follow `docs/operations/communications.md` in vexelhms
+with an owner-named consenting recipient. Registration-token/FID migration remains
+deferred (DD-028). No automatic WhatsApp implementation is included.

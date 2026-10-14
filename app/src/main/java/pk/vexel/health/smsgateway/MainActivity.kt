@@ -37,9 +37,11 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import pk.vexel.health.smsgateway.transport.GatewayApi
 import pk.vexel.health.smsgateway.transport.GatewayConfig
+import pk.vexel.health.smsgateway.transport.WakeReceipt
 import pk.vexel.health.smsgateway.work.GatewaySyncWorker
 
 class MainActivity : ComponentActivity() {
+    private var wakeSummary by mutableStateOf("Last FCM wake received: Never")
     private val scan = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK) result.data?.getStringExtra("pairing_payload")?.let(::pair)
     }
@@ -74,6 +76,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         Text(status)
+                        Text(wakeSummary)
                         if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
                             Text("SMS permission is required before this phone can claim or send gateway messages.")
                         }
@@ -95,6 +98,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        wakeSummary = WakeReceipt.summary(this)
     }
 
     private fun pair(raw: String) {

@@ -9,11 +9,11 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.PrimaryKey
 import androidx.room.Query
-import androidx.room.ForeignKey
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import java.util.UUID
+import pk.vexel.health.smsgateway.work.SendSafety
 
 @Entity(tableName = "gateway_work", indices = [Index(value = ["attemptId"], unique = true)])
 data class GatewayWork(
@@ -52,10 +52,10 @@ abstract class GatewayDao {
     @Query("SELECT * FROM gateway_events WHERE attemptId = :attempt AND eventType = :type LIMIT 1") abstract fun event(attempt: String, type: String): GatewayEvent?
     @Insert(onConflict = OnConflictStrategy.IGNORE) abstract fun insertEvent(event: GatewayEvent): Long
     @Query("UPDATE gateway_events SET synced = 1 WHERE eventId = :id") abstract fun markSynced(id: String)
-    @Query("DELETE FROM gateway_events WHERE attemptId = :attempt") abstract fun deleteAttemptEvents(attempt: String)
-    @Query("DELETE FROM gateway_work WHERE attemptId = :attempt") abstract fun deleteWork(attempt: String)
     @Query("SELECT COUNT(*) FROM gateway_events WHERE attemptId = :attempt AND eventType = :type AND synced = 0") abstract fun hasPending(attempt: String, type: String): Int
-    @Query("SELECT * FROM gateway_work WHERE state = 'PHYSICAL' ORDER BY updatedAt LIMIT 1") abstract fun physicalWork(): GatewayWork?
+    // Includes the legacy crash gap: start event synchronized, STARTING state retained.
+    @Query("SELECT gateway_work.* FROM gateway_work WHERE state = 'PHYSICAL' OR (state = 'STARTING' AND EXISTS (SELECT 1 FROM gateway_events WHERE gateway_events.attemptId = gateway_work.attemptId AND eventType = 'SEND_STARTED' AND synced = 1)) ORDER BY updatedAt LIMIT 1")
+    abstract fun physicalWork(): GatewayWork?
 
     @Transaction open fun persistClaim(work: GatewayWork): Boolean = insertWork(work) != -1L
     @Transaction open fun recordCallback(callback: GatewayCallback): Triple<Int, Int, Int> {
@@ -70,14 +70,30 @@ abstract class GatewayDao {
         if (event(work.attemptId, "SEND_STARTED") == null) insertEvent(started)
         setState(work.attemptId, "STARTING")
     }
-    @Transaction open fun markInvoking(attempt: String) = setState(attempt, "INVOKING")
-    @Transaction open fun discardBeforeSend(attempt: String) {
-        deleteAttemptEvents(attempt)
-        deleteWork(attempt)
+    @Transaction open fun acknowledgeEvent(event: GatewayEvent) {
+        markSynced(event.eventId)
+        val current = work(event.attemptId) ?: return
+        if (event.eventType == "SEND_STARTED" && SendSafety.canAuthorize(current.state)) {
+            setState(current.attemptId, "PHYSICAL")
+        }
+    }
+    @Transaction open fun markInvoking(attempt: String): Boolean {
+        val current = work(attempt) ?: return false
+        if (current.state != "PHYSICAL") return false
+        setState(attempt, "INVOKING")
+        return true
+    }
+    @Transaction open fun archiveBeforeSend(event: GatewayEvent) {
+        val current = work(event.attemptId) ?: return
+        if (!SendSafety.canAuthorize(current.state)) return
+        markSynced(event.eventId)
+        // Retain durable evidence. An UNKNOWN server outcome still needs staff review.
+        setState(current.attemptId, "REVIEW_REQUIRED")
     }
     @Transaction open fun recordCallback(work: GatewayWork, nextState: String, callback: GatewayEvent) {
         insertEvent(callback)
-        setState(work.attemptId, nextState)
+        val current = work(work.attemptId) ?: return
+        setState(work.attemptId, SendSafety.nextCallbackState(current.state, nextState))
     }
 }
 
